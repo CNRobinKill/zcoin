@@ -1,5 +1,5 @@
 ---
-name: "zcoin-osx-0.13.3.3"
+name: "zcoin-osx-0.13.6"
 enable_cache: true
 suites:
 - "trusty"

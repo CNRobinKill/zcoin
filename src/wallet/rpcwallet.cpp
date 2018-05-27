@@ -3,15 +3,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-//btzc: N value
-#define ZEROCOIN_MODULUS   "25195908475657893494027183240048398571429282126204032027777137836043662020707595556264018525880784406918290641249515082189298559149176184502808489120072844992687392807287776735971418347270261896375014971824691165077613379859095700097330459748808428401797429100642458691817195118746121515172654632282216869987549182422433637259085141865462043576798423387184774447920739934236584823824281198163815010674810451660377306056201619676256133844143603833904414952634432190114657544454178424020924616515723350778707749817125772467962926386356373289912154831438167899885040445364023527381951378636564391212010397122822120720357"
-
 #include "amount.h"
 #include "base58.h"
 #include "chain.h"
 #include "core_io.h"
 #include "init.h"
 #include "main.h"
+#include "zerocoin.h"
 #include "net.h"
 #include "netbase.h"
 #include "policy/rbf.h"
@@ -21,6 +19,7 @@
 #include "utilmoneystr.h"
 #include "wallet.h"
 #include "walletdb.h"
+#include "zerocoin.h"
 
 #include <stdint.h>
 
@@ -2675,58 +2674,14 @@ UniValue mintzerocoin(const UniValue& params, bool fHelp)
     LogPrintf("rpcWallet.mintzerocoin() denomination = %s, nAmount = %s \n", denomination, nAmount);
 
 
-    // zerocoin init
-    CBigNum bnTrustedModulus;
-
-    // Loads a trusted Zerocoin modulus "N"
-    bnTrustedModulus.SetHex(ZEROCOIN_MODULUS);
-
-    // Set up the Zerocoin Params object
-    libzerocoin::Params *ZCParams = new libzerocoin::Params(bnTrustedModulus);
+    // Always use modulus v2
+    libzerocoin::Params *zcParams = ZCParamsV2;
 
     // The following constructor does all the work of minting a brand
     // new zerocoin. It stores all the private values inside the
     // PrivateCoin object. This includes the coin secrets, which must be
     // stored in a secure location (wallet) at the client.
-    libzerocoin::PrivateCoin newCoin(ZCParams, denomination);
-
-    std::list <CZerocoinEntry> listPubCoin = std::list<CZerocoinEntry>();
-    CWalletDB walletdb(pwalletMain->strWalletFile);
-    walletdb.ListPubCoin(listPubCoin);
-
-    int currentId = 1;
-    unsigned int countExistingItems = 0;
-
-    BOOST_FOREACH(const CZerocoinEntry &pubCoinIdItem, listPubCoin) {
-		//LogPrintf("denomination = %d, id = %d, height = %d\n", pubCoinIdItem.denomination, pubCoinIdItem.id, pubCoinIdItem.nHeight);
-		if (pubCoinIdItem.id > 0) {
-			if(pubCoinIdItem.nHeight <= chainActive.Height()){
-				if (pubCoinIdItem.denomination == denomination) {
-					countExistingItems++;
-					if (pubCoinIdItem.id > currentId) {
-						currentId = pubCoinIdItem.id;
-						countExistingItems = 1;
-					}
-				}
-			}else{
-				break;
-			}
-		}
-    }
-
-    if (countExistingItems > 9) {
-    	currentId++;
-    }
-
-    if (((denomination == libzerocoin::ZQ_LOVELACE) && (currentId >= ZC_V2_SWITCH_ID_1))
-    		|| ((denomination == libzerocoin::ZQ_GOLDWASSER) && (currentId >= ZC_V2_SWITCH_ID_10))
-    		|| ((denomination == libzerocoin::ZQ_RACKOFF) && (currentId >= ZC_V2_SWITCH_ID_25))
-    		|| ((denomination == libzerocoin::ZQ_PEDERSEN) && (currentId >= ZC_V2_SWITCH_ID_50))
-    		|| ((denomination == libzerocoin::ZQ_WILLIAMSON) && (currentId >= ZC_V2_SWITCH_ID_100))) {
-    	newCoin.setVersion(2);
-    }
-
-
+    libzerocoin::PrivateCoin newCoin(zcParams, denomination, ZEROCOIN_TX_VERSION_2);
     // Get a copy of the 'public' portion of the coin. You should
     // embed this into a Zerocoin 'MINT' transaction along with a series
     // of currency inputs totaling the assigned value of one zerocoin.
@@ -2753,12 +2708,14 @@ UniValue mintzerocoin(const UniValue& params, bool fHelp)
         zerocoinTx.IsUsed = false;
         zerocoinTx.denomination = denomination;
         zerocoinTx.value = pubCoin.getValue();
-        libzerocoin::PublicCoin checkPubCoin(ZCParams, zerocoinTx.value, denomination);
+        libzerocoin::PublicCoin checkPubCoin(zcParams, zerocoinTx.value, denomination);
         if (!checkPubCoin.validate()) {
             return false;
         }
         zerocoinTx.randomness = newCoin.getRandomness();
         zerocoinTx.serialNumber = newCoin.getSerialNumber();
+        const unsigned char *ecdsaSecretKey = newCoin.getEcdsaSeckey();
+        zerocoinTx.ecdsaSecretKey = std::vector<unsigned char>(ecdsaSecretKey, ecdsaSecretKey+32);
         walletdb.WriteZerocoinEntry(zerocoinTx);
 
         return pubCoin.getValue().GetHex();
@@ -2840,6 +2797,7 @@ UniValue resetmintzerocoin(const UniValue& params, bool fHelp) {
             zerocoinTx.serialNumber = zerocoinItem.serialNumber;
             zerocoinTx.nHeight = -1;
             zerocoinTx.randomness = zerocoinItem.randomness;
+            zerocoinTx.ecdsaSecretKey = zerocoinItem.ecdsaSecretKey;
             walletdb.WriteZerocoinEntry(zerocoinTx);
         }
     }
@@ -2883,6 +2841,45 @@ UniValue listmintzerocoins(const UniValue& params, bool fHelp) {
     return results;
 }
 
+
+UniValue listpubcoins(const UniValue& params, bool fHelp) {
+    if (fHelp || params.size() > 1)
+        throw runtime_error(
+                "listpubcoin <all>(1/10/25/50/100)\n"
+                        "\nArguments:\n"
+                        "1. <all> (int, optional) 1,10,25,50,100 (default) to return all pubcoin with denomination. empty to return all pubcoin.\n"
+                        "\nResults are an array of Objects, each of which has:\n"
+                        "{id, IsUsed, denomination, value, serialNumber, nHeight, randomness}");
+
+    int denomination = -1;
+    if (params.size() > 0) {
+        denomination = params[0].get_int();
+    }
+
+    list <CZerocoinEntry> listPubcoin;
+    CWalletDB walletdb(pwalletMain->strWalletFile);
+    walletdb.ListPubCoin(listPubcoin);
+    UniValue results(UniValue::VARR);
+    listPubcoin.sort(CompID);
+
+    BOOST_FOREACH(const CZerocoinEntry &zerocoinItem, listPubcoin) {
+        if (zerocoinItem.id > 0 && (denomination < 0 || zerocoinItem.denomination == denomination)) {
+            UniValue entry(UniValue::VOBJ);
+            entry.push_back(Pair("id", zerocoinItem.id));
+            entry.push_back(Pair("IsUsed", zerocoinItem.IsUsed));
+            entry.push_back(Pair("denomination", zerocoinItem.denomination));
+            entry.push_back(Pair("value", zerocoinItem.value.GetHex()));
+            entry.push_back(Pair("serialNumber", zerocoinItem.serialNumber.GetHex()));
+            entry.push_back(Pair("nHeight", zerocoinItem.nHeight));
+            entry.push_back(Pair("randomness", zerocoinItem.randomness.GetHex()));
+            results.push_back(entry);
+        }
+    }
+
+    return results;
+}
+
+
 UniValue setmintzerocoinstatus(const UniValue& params, bool fHelp) {
     if (fHelp || params.size() != 2)
         throw runtime_error(
@@ -2916,7 +2913,11 @@ UniValue setmintzerocoinstatus(const UniValue& params, bool fHelp) {
                 zerocoinTx.serialNumber = zerocoinItem.serialNumber;
                 zerocoinTx.nHeight = zerocoinItem.nHeight;
                 zerocoinTx.randomness = zerocoinItem.randomness;
-                pwalletMain->NotifyZerocoinChanged(pwalletMain, zerocoinTx.value.GetHex(), zerocoinTx.IsUsed ? "Used" : "New", CT_UPDATED);
+                zerocoinTx.ecdsaSecretKey = zerocoinItem.ecdsaSecretKey;
+                const std::string& isUsedDenomStr = zerocoinTx.IsUsed
+                        ? "Used (" + std::to_string(zerocoinTx.denomination) + " mint)"
+                        : "New (" + std::to_string(zerocoinTx.denomination) + " mint)";
+                pwalletMain->NotifyZerocoinChanged(pwalletMain, zerocoinTx.value.GetHex(), isUsedDenomStr, CT_UPDATED);
                 walletdb.WriteZerocoinEntry(zerocoinTx);
 
                 UniValue entry(UniValue::VOBJ);
@@ -3045,6 +3046,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "resetmintzerocoin",        &resetmintzerocoin,        false },
     { "wallet",             "setmintzerocoinstatus",        &setmintzerocoinstatus,        false },
     { "wallet",             "listmintzerocoins",        &listmintzerocoins,        false },
+    { "wallet",             "listpubcoins",        &listpubcoins,        false },
     { "wallet",             "removetxmempool",          &removetxmempool,          false },
     { "wallet",             "removetxwallet",           &removetxwallet,           false },
 };
